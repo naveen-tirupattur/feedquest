@@ -1,0 +1,23 @@
+# Core dependencies
+fastmcp==2.12.4
+fastapi==0.118.0
+uvicorn==0.37.0
+pydantic==2.11.9
+pydantic-core==2.33.2
+
+# RSS Feed handling
+feedparser==6.0.12
+beautifulsoup4==4.14.2
+
+# OpenAI API and LLM integration
+openai==2.0.0
+httpx==0.28.1
+
+# Utilities and support libraries
+python-dotenv==1.1.1
+rich==14.1.0
+
+# Development dependencies
+pytest==7.4.3
+black==23.12.1
+pylint==3.0.3
