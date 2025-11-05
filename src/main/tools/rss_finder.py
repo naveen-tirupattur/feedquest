@@ -4,7 +4,7 @@ The function follows a simple two‑step strategy:
 1. Fetch the HTML of the site and look for ``<link>`` tags with ``type`` set to
    ``application/rss+xml`` or ``application/atom+xml``. The ``href`` attribute is
    resolved against the base URL.
-2. If step 1 fails, attempt to parse the original URL directly with ``feedparser``;
+2. If step 1 fails, attempt to parse the original URL directly with ``feedparser``;
    some sites serve the feed at the root URL (e.g. ``example.com/feed``) and the
    parser will succeed when entries are present.
 
@@ -49,13 +49,14 @@ def find_rss_feed(site_url: str, timeout: int = 5) -> Optional[str]:
         HTTP request timeout in seconds.
     """
     try:
-        response = requests.get(site_url, timeout=timeout, headers={"User-Agent": "RSS‑Finder/1.0"})
+        # Use plain ASCII hyphen (-) in the User-Agent to avoid encoding errors
+        response = requests.get(site_url, timeout=timeout, headers={"User-Agent": "RSS-Finder/1.0"})
         response.raise_for_status()
     except Exception as exc:  # pragma: no cover – network errors are environment specific
         logger.error("Failed to fetch site %s: %s", site_url, exc)
         return None
 
-    # 1️⃣ Try HTML discovery
+    # Try HTML discovery
     soup = BeautifulSoup(response.text, "html.parser")
     link_href = _find_link_tag(soup)
     if link_href:
@@ -63,7 +64,7 @@ def find_rss_feed(site_url: str, timeout: int = 5) -> Optional[str]:
         logger.info("Discovered feed via <link>: %s", feed_url)
         return feed_url
 
-    # 2️⃣ Fallback – parse the URL itself as a feed
+    # Fallback – parse the URL itself as a feed
     parsed = feedparser.parse(site_url)
     if not parsed.bozo and parsed.entries:
         logger.info("Site URL itself is a valid feed: %s", site_url)
@@ -71,4 +72,3 @@ def find_rss_feed(site_url: str, timeout: int = 5) -> Optional[str]:
 
     logger.info("No feed found for %s", site_url)
     return None
-

@@ -9,8 +9,8 @@ Available tools:
 import os
 from fastmcp import FastMCP
 
-from rss_finder import find_rss_feed
-from registry import add_feed, list_feeds
+from src.feed_utils import register_feed as register
+from src.main.tools.registry import list_feeds
 
 mcp = FastMCP()
 
@@ -19,17 +19,11 @@ mcp = FastMCP()
 async def register_feed(site_url: str) -> str:
     """Detect an RSS/Atom feed for *site_url* and add it to the registry.
 
-    Returns a human‑readable status message.
+    Delegates to the shared ``register_feed`` implementation and returns the
+    resulting message string.
     """
-    feed_url = find_rss_feed(site_url)
-    if not feed_url:
-        return f"No RSS/Atom feed found for {site_url}."
-
-    added = add_feed(feed_url)
-    if added:
-        return f"Feed registered: {feed_url}"
-    else:
-        return f"Feed already registered: {feed_url}"
+    result = register(site_url)
+    return result["message"]
 
 
 @mcp.tool
@@ -50,4 +44,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

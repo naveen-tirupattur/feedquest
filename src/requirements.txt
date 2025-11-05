@@ -1,4 +1,0 @@
-fastmcp
-requests
-beautifulsoup4
-feedparser
