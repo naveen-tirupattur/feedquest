@@ -1,51 +1,53 @@
-from typing import Dict
-from fastmcp import FastMCP
+"""FastMCP server exposing minimal RSS‑feed discovery tools.
+
+Available tools:
+* ``register_feed(site_url: str) -> str`` – finds an RSS/Atom feed for the given site and
+  stores it in the local registry.
+* ``list_registered_feeds() -> str`` – returns a newline‑separated list of stored feed URLs.
+"""
+
 import os
+from fastmcp import FastMCP
 
-from src.main.tools.rss_feed_fetcher import fetch_rss_feed
+from rss_finder import find_rss_feed
+from registry import add_feed, list_feeds
 
-# Initialize FastMCP server
 mcp = FastMCP()
 
-# Default RSS feed URL
-DEFAULT_RSS_URL = "https://hnrss.org/newest?points=300"
-
-def format_story(story: Dict[str, str]) -> str:
-    """Format a Hacker News story for display"""
-    return f"""Title: {story['title']}
-Link: {story['link']}
-Published: {story['published']}
-Author: {story['author']}"""
 
 @mcp.tool
-async def get_stories(
-        feed_url: str = DEFAULT_RSS_URL, count: int = 30
-) -> str:
-    """Get top stories
+async def register_feed(site_url: str) -> str:
+    """Detect an RSS/Atom feed for *site_url* and add it to the registry.
 
-    Args:
-        feed_url: URL of the RSS feed to use (default: Hacker News)
-        count: Number of stories to return (default: 30)
+    Returns a human‑readable status message.
     """
-    try:
-        # Use our RSS tool to fetch and parse the feed
-        stories = fetch_rss_feed(feed_url, count)
+    feed_url = find_rss_feed(site_url)
+    if not feed_url:
+        return f"No RSS/Atom feed found for {site_url}."
 
-        if not stories:
-            return "No stories found."
-
-        formatted_stories = [format_story(story) for story in stories]
-        return "\n---\n".join(formatted_stories)
-
-    except Exception as e:
-        return f"Error fetching stories: {str(e)}"
+    added = add_feed(feed_url)
+    if added:
+        return f"Feed registered: {feed_url}"
+    else:
+        return f"Feed already registered: {feed_url}"
 
 
-def main():
-    # Initialize and run the server
+@mcp.tool
+async def list_registered_feeds() -> str:
+    """Return all registered feed URLs as a newline‑separated string."""
+    feeds = list_feeds()
+    if not feeds:
+        return "No feeds registered."
+    return "\n".join(feeds)
+
+
+def main() -> None:
+    """Entry point – start the FastMCP server on stdio transport."""
     port = int(os.getenv("MCP_PORT", "8000"))
-    print(f"Starting FastMCP server on port {port}...")
-    mcp.run(transport='stdio')
+    print(f"RSS‑Finder FastMCP server listening on port {port} (stdio transport)")
+    mcp.run(transport="stdio")
+
 
 if __name__ == "__main__":
     main()
+
