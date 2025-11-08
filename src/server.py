@@ -9,8 +9,9 @@ Available tools:
 import os
 from fastmcp import FastMCP
 
-from src.feed_utils import register_feed as register
+from src.main.tools.utils import register_feed as register
 from src.main.tools.registry import list_feeds
+from src.main.tools.fetcher import fetch_all_entries
 
 mcp = FastMCP()
 
@@ -28,11 +29,28 @@ async def register_feed(site_url: str) -> str:
 
 @mcp.tool
 async def list_registered_feeds() -> str:
-    """Return all registered feed URLs as a newline‑separated string."""
+    """Return all registered feeds as a JSON‑serialisable string.
+
+    The underlying ``list_feeds`` now returns a list of dicts.  For the FastMCP
+    tool we serialize the list to a JSON string so the consumer can parse it.
+    """
     feeds = list_feeds()
     if not feeds:
         return "No feeds registered."
-    return "\n".join(feeds)
+    import json
+
+    return json.dumps(feeds)
+
+
+@mcp.tool
+async def fetch_entries() -> str:
+    """Fetch new articles from all registered feeds concurrently.
+
+    Calls the asynchronous ``fetch_all_entries`` utility and returns a concise
+    status string.
+    """
+    processed, added = await fetch_all_entries()
+    return f"Fetched entries from {processed} feeds; added {added} new entries."
 
 
 def main() -> None:

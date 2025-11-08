@@ -1,8 +1,10 @@
 from fastapi import FastAPI
-from src.feed_utils import register_feed as register
+from typing import Optional
+from src.main.tools.utils import register_feed as register
 from src.main.tools.registry import list_feeds
+from src.main.tools.fetcher import fetch_all_entries, fetch_feed
 import uvicorn
-from typing import List
+from typing import List, Dict
 
 app = FastAPI(
     title="FeedQuest API",
@@ -23,13 +25,42 @@ async def register_feed(site_url: str) -> dict:
     # Reuse the shared registration logic
     return register(site_url)
 
-@app.get(path="/listFeeds", tags=["Feed"], summary="List registered feeds",
-         description="Return all registered feed URLs as a newline-separated string.")
-async def list_registered_feeds() -> List[str]:
+@app.get(
+    path="/listFeeds",
+    tags=["Feed"],
+    summary="List registered feeds",
+    description="Return all registered feeds with metadata as a JSON list.",
+)
+async def list_registered_feeds() -> List[Dict[str, str]]:
     feeds = list_feeds()
     if not feeds:
-        return ["No feeds registered."]
+        # Return an empty list; the client can interpret as no feeds.
+        return []
     return feeds
+
+
+@app.post(
+    "/fetchEntries",
+    tags=["Feed"],
+    summary="Fetch new entries",
+    description=(
+        "Fetch the latest articles either for a specific RSS/Atom feed (if ``url`` "
+        "is supplied) or for all registered feeds. Returns a JSON summary with "
+        "the number of feeds processed and entries added."
+    ),
+)
+async def fetch_entries_endpoint(url: Optional[str] = None) -> dict:
+    """FastAPI wrapper that supports optional single‑feed fetching.
+
+    * If ``url`` is provided, only that feed is fetched via ``fetch_feed``.
+    * Otherwise, ``fetch_all_entries`` processes every registered feed.
+    """
+    if url:
+        added = await fetch_feed(url)
+        processed = 1
+    else:
+        processed, added = await fetch_all_entries()
+    return {"processed_feeds": processed, "added_entries": added}
 
 
 def main():
