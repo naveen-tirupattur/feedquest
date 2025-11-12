@@ -24,7 +24,6 @@ from feedparser import FeedParserDict
 
 logger = logging.getLogger(__name__)
 
-
 def _find_link_tag(soup: BeautifulSoup) -> Optional[str]:
     """Search ``<link>`` tags for RSS/Atom declarations.
 
@@ -37,7 +36,6 @@ def _find_link_tag(soup: BeautifulSoup) -> Optional[str]:
             if href:
                 return href
     return None
-
 
 def find_rss_feed(site_url: str, timeout: int = 5) -> Dict[str, str]:
     """Discover an RSS/Atom feed for *site_url* and collect basic metadata.
@@ -55,6 +53,7 @@ def find_rss_feed(site_url: str, timeout: int = 5) -> Dict[str, str]:
     returned.
     """
     feed_url: str | None = None
+    parsed_feed = None
     try:
         response = requests.get(
             site_url,
@@ -74,8 +73,9 @@ def find_rss_feed(site_url: str, timeout: int = 5) -> Dict[str, str]:
         logger.info("Discovered feed via <link>: %s", feed_url)
     else:
         # 2️⃣ Fallback – treat the supplied URL itself as a possible feed
-        parsed = feedparser.parse(site_url)
-        if not parsed.bozo and parsed.entries:
+        # Parse once to check validity, reuse the result
+        parsed_feed = feedparser.parse(site_url)
+        if not parsed_feed.bozo and parsed_feed.entries:
             feed_url = site_url
             logger.info("Site URL itself is a valid feed: %s", site_url)
 
@@ -83,8 +83,10 @@ def find_rss_feed(site_url: str, timeout: int = 5) -> Dict[str, str]:
         logger.info("No feed found for %s", site_url)
         return {}
 
-    # Parse the discovered feed to gather metadata
-    parsed_feed = feedparser.parse(feed_url)
+    # Parse the discovered feed to gather metadata (reuse if we already parsed)
+    if parsed_feed is None or feed_url != site_url:
+        parsed_feed = feedparser.parse(feed_url)
+
     result: Dict[str, str] = {"url": feed_url}
     # Feed title – may be missing
     if getattr(parsed_feed, "feed", None) and parsed_feed.feed.get("title"):
@@ -100,7 +102,6 @@ def find_rss_feed(site_url: str, timeout: int = 5) -> Dict[str, str]:
 def clean_html(html_content):
     soup = BeautifulSoup(html_content, 'html.parser')
     return soup.get_text(separator=' ', strip=True)
-
 
 def parse_feed(feed_response: FeedParserDict) -> List[Dict[str, str]]:
     """Extract entries from a parsed feed response.

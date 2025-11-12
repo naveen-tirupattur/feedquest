@@ -11,17 +11,44 @@ from __future__ import annotations
 import os
 import sqlite3
 from pathlib import Path
+from contextlib import contextmanager
+from queue import Queue
+from threading import Lock
 
 DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "feeds.db"))
+_pool: Queue | None = None
+_pool_lock = Lock()
+_pool_size = 5
 
+def _init_pool() -> None:
+    """Initialize the connection pool."""
+    global _pool
+    _pool = Queue(maxsize=_pool_size)
+    for _ in range(_pool_size):
+        conn = sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        _pool.put(conn)
+
+@contextmanager
 def get_connection() -> sqlite3.Connection:
-    """Return a SQLite connection ready for use.
-
-    ``check_same_thread=False`` allows the same connection object to be used in
-    background threads (useful for async fetchers).  Callers are responsible for
-    closing the connection when done.
+    """Return a pooled SQLite connection as a context manager.
+    
+    Usage:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            ...
     """
-    return sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False)
+    global _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:
+                _init_pool()
+    
+    conn = _pool.get()
+    try:
+        yield conn
+    finally:
+        _pool.put(conn)
 
 def init_schema() -> None:
     """Create tables if they do not exist.
@@ -36,7 +63,8 @@ def init_schema() -> None:
     with open(schema_path, "r", encoding="utf-8") as f:
         sql = f.read()
 
-    conn = get_connection()
+    # Create a fresh connection for schema initialization (outside pool)
+    conn = sqlite3.connect(DB_PATH, timeout=5, check_same_thread=False)
     try:
         conn.executescript(sql)
         conn.commit()
