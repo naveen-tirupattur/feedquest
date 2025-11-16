@@ -9,7 +9,7 @@ Available tools:
 import os
 from fastmcp import FastMCP
 
-from src.main.tools.utils import register_feed as register
+from src.main.tools.rss_feed_utils import register_feed as register
 from src.main.tools.registry import list_feeds
 from src.main.tools.fetcher import fetch_all_entries
 

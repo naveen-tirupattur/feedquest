@@ -1,108 +1,181 @@
+import asyncio
 import json
-import requests
+import logging
+import os
 import time
 from typing import Dict, List, Union
 
-# Rate limiter for free tier (Groq: max 30 requests per minute)
-_request_times = []  # Track timestamps of recent requests
+import aiohttp
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 MAX_REQUESTS_PER_MINUTE = 30
 
-def summarize_text(text: str) -> Dict[str, Union[List[str], str]]:
-    """Summarize *text* using structured output.
+if not GROQ_API_KEY:
+    raise ValueError("GROQ_API_KEY environment variable not set")
+
+
+class SummarizationError(Exception):
+    """Base exception for summarization failures."""
+    pass
+
+
+class RetryableError(SummarizationError):
+    """Errors that should trigger a retry (rate limits, timeouts, server errors)."""
+    pass
+
+
+class NonRetryableError(SummarizationError):
+    """Errors that should not be retried (auth, validation, malformed)."""
+    pass
+
+
+class RateLimiter:
+    """Token bucket rate limiter for API calls."""
+
+    def __init__(self, max_requests: int, window_seconds: int):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.request_times: List[float] = []
+
+    async def acquire(self):
+        """Wait if necessary to stay under rate limit."""
+        now = time.time()
+
+        # Remove requests older than the window
+        self.request_times = [t for t in self.request_times if now - t < self.window_seconds]
+
+        # If we've hit the limit, wait until the oldest request exits the window
+        if len(self.request_times) >= self.max_requests:
+            wait_time = self.window_seconds - (now - self.request_times[0])
+            if wait_time > 0:
+                logger.info("Rate limit approaching (30/min). Waiting %.1f seconds...", wait_time)
+                await asyncio.sleep(wait_time)
+                now = time.time()
+                self.request_times = [t for t in self.request_times if now - t < self.window_seconds]
+
+        self.request_times.append(now)
+
+
+# Global rate limiter
+_summarizer_limiter = RateLimiter(max_requests=MAX_REQUESTS_PER_MINUTE, window_seconds=60)
+
+
+async def summarize_text(text: str) -> Dict[str, Union[List[str], str]]:
+    """Summarize *text* using structured output with async/await.
 
     The function returns a dictionary with two keys:
     * ``"summary"`` – the concise summary string (empty on error).
     * ``"ai_tags"`` – a list of extracted tags (empty list on error).
+
+    Raises:
+    * ``RetryableError`` for rate limits, timeouts, and server errors.
+    * ``NonRetryableError`` for authentication and validation errors.
     """
     system_prompt = (
         "You are a helpful assistant that summarizes text content concisely and clearly. "
         "Based on the input, provide a clear and concise summary highlighting "
         "the key themes in 100 words or less. Extract relevant tags and include them. No Yapping!"
+        """ Respond only with JSON using this format:
+        {
+            "tags": [
+                "tag1",
+                "tag2",
+                "tag3"
+            ],
+            "summary": "Short and concise summary"
+        }"""
     )
+
     api_url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": "Bearer ",
-    }
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
 
     payload = {
         "model": "openai/gpt-oss-120b",
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": text}
+            {"role": "user", "content": text},
         ],
+        "response_format": {"type": "json_object"},
     }
-    summary = ""
-    tags = []
+
+    # Apply rate limiting
+    await _summarizer_limiter.acquire()
 
     try:
-        # Rate limiting: keep total requests under 30 per minute
-        global _request_times
-        current_time = time.time()
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(api_url, headers=headers, json=payload) as response:
+                # Handle 429 (rate limit) – retryable
+                if response.status == 429:
+                    raise RetryableError("Rate limit hit (429)")
 
-        # Remove requests older than 1 minute
-        _request_times = [t for t in _request_times if current_time - t < 60]
+                # Handle 5xx (server errors) – retryable
+                if response.status >= 500:
+                    raise RetryableError(f"Server error {response.status}")
 
-        # If we've hit the limit, wait until the oldest request is outside the window
-        if len(_request_times) >= MAX_REQUESTS_PER_MINUTE:
-            wait_time = 60 - (current_time - _request_times[0])
-            print(f"Rate limit approaching (30/min). Waiting {wait_time:.1f}s...")
-            time.sleep(wait_time)
-            # Recalculate after waiting
-            current_time = time.time()
-            _request_times = [t for t in _request_times if current_time - t < 60]
+                # Handle 401/403 (auth) – non-retryable
+                if response.status in (401, 403):
+                    raise NonRetryableError(f"Authentication error {response.status}")
 
-        _request_times.append(current_time)
-        response = requests.post(api_url, headers=headers, json=payload)
+                # Handle other 4xx (client errors) – non-retryable
+                if response.status >= 400:
+                    raise NonRetryableError(f"Client error {response.status}")
 
-        # Don't retry on 429, just return empty
-        if response.status_code == 429:
-            print("Rate limit hit (429). Returning empty summary.")
-            return {"summary": "", "ai_tags": []}
+                try:
+                    data = await response.json()
+                except (json.JSONDecodeError, ValueError):
+                    raise NonRetryableError("Invalid JSON response")
 
-        response.raise_for_status()
+                # Validate response structure
+                if not isinstance(data, dict) or "choices" not in data:
+                    raise NonRetryableError("Unexpected response structure: missing 'choices'")
 
-        try:
-            data = response.json()
-        except ValueError:
-            print("Error during summarization: invalid JSON response")
-            return {"summary": "", "ai_tags": []}
+                if not isinstance(data["choices"], list) or len(data["choices"]) == 0:
+                    raise NonRetryableError("Unexpected response structure: empty choices")
 
-        # Extract structured output from OpenAI/Groq format: choices[0].message.content
-        if not (isinstance(data, dict) and "choices" in data and
-                isinstance(data["choices"], list) and len(data["choices"]) > 0):
-            print("Error during summarization: unexpected response structure")
-            return {"summary": "", "ai_tags": []}
+                choice = data["choices"][0]
+                if not isinstance(choice, dict) or "message" not in choice:
+                    raise NonRetryableError("Unexpected response structure: missing message")
 
-        choice = data["choices"][0]
-        if not (isinstance(choice, dict) and "message" in choice):
-            print("Error during summarization: missing message in response")
-            return {"summary": "", "ai_tags": []}
+                message = choice["message"]
+                if not isinstance(message, dict) or "content" not in message:
+                    raise NonRetryableError("Unexpected response structure: missing content")
 
-        message = choice["message"]
-        if not (isinstance(message, dict) and "content" in message):
-            print("Error during summarization: missing content in message")
-            return {"summary": "", "ai_tags": []}
+                content_str = message["content"]
+                try:
+                    parsed = json.loads(content_str)
+                except json.JSONDecodeError as e:
+                    raise NonRetryableError(f"Invalid JSON in response content: {e}")
 
-        # Parse the JSON structured output
-        content_str = message["content"]
-        try:
-            parsed = json.loads(content_str)
-            summary = str(parsed.get("summary", "")).strip()
-            tags = parsed.get("tags", []) or []
-        except (json.JSONDecodeError, TypeError) as e:
-            print(f"Error parsing structured output: {e}")
-            return {"summary": "", "ai_tags": []}
+                summary = str(parsed.get("summary", "")).strip()
+                tags = parsed.get("tags", []) or []
 
-    except requests.RequestException as e:
-        print(f"Error during summarization: {e}")
-        return {"summary": "", "ai_tags": []}
+                # Validate tags is a list of strings
+                if not isinstance(tags, list):
+                    tags = []
+                else:
+                    tags = [str(t) for t in tags]
 
-    # Ensure tags is a list of strings
-    if not isinstance(tags, list):
-        tags = []
-    return {"summary": summary, "ai_tags": tags}
+                return {"summary": summary, "ai_tags": tags}
+
+    except asyncio.TimeoutError:
+        raise RetryableError("Request timeout")
+    except aiohttp.ClientError as e:
+        raise RetryableError(f"Network error: {e}")
+
 
 if __name__ == "__main__":
-    test_text = "The quick brown fox jumps over the lazy dog. This is a test of the summarization function."
-    result = summarize_text(test_text)
-    print("Summary:", result)
+    async def main():
+        test_text = "The quick brown fox jumps over the lazy dog. This is a test of the summarization function."
+        try:
+            result = await summarize_text(test_text)
+            print("Summary:", result)
+        except Exception as e:
+            print(f"Error: {e}")
+
+    asyncio.run(main())

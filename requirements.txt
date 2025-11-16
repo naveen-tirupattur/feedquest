@@ -12,8 +12,9 @@ beautifulsoup4==4.14.2
 # OpenAI API and LLM integration
 openai==2.0.0
 
-# Async HTTP client (replaces requests for better async support)
+# Async HTTP clients
 httpx==0.28.1
+aiohttp==3.10.11
 
 # Utilities and support libraries
 python-dotenv==1.1.1

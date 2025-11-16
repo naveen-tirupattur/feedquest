@@ -18,8 +18,8 @@ import feedparser
 import httpx
 
 from src.main.tools.registry import add_entry, list_feeds, add_feed, get_feed
-from src.main.tools.summarizer import summarize_text
-from src.main.tools.rss_feed_utils import parse_feed
+from src.main.tools.summarizer import summarize_text, RetryableError, NonRetryableError
+from src.main.tools.rss_feed_utils import parse_feed, register_feed
 
 # Global async lock to serialize SQLite writes across concurrent feed fetches.
 _db_write_lock = asyncio.Lock()
@@ -27,8 +27,6 @@ _db_write_lock = asyncio.Lock()
 _summarizer_semaphore = asyncio.Semaphore(1)
 
 logger = logging.getLogger(__name__)
-# Minimum pause (seconds) after each summarizer request to stay under rate limits.
-_summarizer_delay = 5.0
 # Reusable async HTTP client for all feed fetches
 _http_client: httpx.AsyncClient | None = None
 
@@ -65,17 +63,22 @@ async def _process_feed(feed_url: str, _: None = None) -> int:
     implementation that accepted a client; it is ignored.
     """
     # Retrieve stored etag/last_modified for conditional GET (avoid N+1 query).
+
+    etag = None
+    last_modified = None
     stored = get_feed(feed_url)
     if not stored:
         logger.warning("Feed %s not found in registry", feed_url)
-        return 0
-    stored_etag = stored.get("etag")
-    stored_last_modified = stored.get("last_modified")
+        feed_url = register_feed(feed_url)
+        logger.info(stored)
+    else:
+        etag = stored.get("etag")
+        last_modified = stored.get("last_modified")
 
     try:
         client = await _get_http_client()
         response = await _async_fetch(
-            feed_url, client, etag=stored_etag, last_modified=stored_last_modified
+            feed_url, client, etag=etag, last_modified=last_modified
         )
     except Exception as exc:
         logger.error("Error fetching feed %s: %s", feed_url, exc)
@@ -101,6 +104,7 @@ async def _process_feed(feed_url: str, _: None = None) -> int:
     entries = parsed[:5]
     added = 0
     for entry in entries:
+        print("Processing entry: %s", entry.get("title") or entry.get("link"))
         try:
             # Determine text to summarise – prefer full content if available.
             feed_content = None
@@ -115,29 +119,44 @@ async def _process_feed(feed_url: str, _: None = None) -> int:
                 feed_content = entry.get("summary")
             if not feed_content:
                 continue
-            logger.info("Summarizing entry from %s: %s %s", feed_url, entry.get("link"), entry.get("title") or "No title")
-            # Summarize the content with limited concurrency, retry logic, and a final pause.
+            logger.info("Summarizing entry from %s: %s %s",
+                        feed_url, entry.get("link"), entry.get("title") or "No title")
+            # Summarize the content with limited concurrency and intelligent retry logic.
             max_retries = 3
             ai_summary = {"summary": "", "ai_tags": []}
             for attempt in range(max_retries):
                 try:
                     async with _summarizer_semaphore:
-                        ai_summary = summarize_text(feed_content)
-                    # If the LLM returned a non‑empty summary treat it as success.
-                    if ai_summary.get("summary"):
-                        break
-                except Exception as exc:  # pragma: no cover – unexpected errors
-                    logger.error(
-                        "Summarization attempt %d failed for %s: %s",
+                        ai_summary = await summarize_text(feed_content)
+                    # Success – exit retry loop
+                    break
+                except NonRetryableError as exc:
+                    # Don't retry on auth, validation, or format errors
+                    logger.warning(
+                        "Non-retryable error summarizing entry from %s: %s",
+                        feed_url,
+                        exc,
+                    )
+                    break
+                except RetryableError as exc:
+                    # Only log and retry on transient errors (rate limits, timeouts, server errors)
+                    logger.warning(
+                        "Attempt %d failed (retryable) for %s: %s",
                         attempt + 1,
                         feed_url,
                         exc,
                     )
-                # Back‑off with jitter before next attempt.
-                backoff = (2 ** attempt) + random.random()
-                await asyncio.sleep(backoff)
-            # Ensure we respect rate limits after the final (or successful) call.
-            await asyncio.sleep(_summarizer_delay + random.random())
+                    if attempt < max_retries - 1:
+                        # Exponential backoff with jitter
+                        backoff = (2 ** attempt) + random.random()
+                        await asyncio.sleep(backoff)
+                except Exception as exc:  # pragma: no cover – unexpected errors
+                    logger.error(
+                        "Unexpected error summarizing entry from %s: %s",
+                        feed_url,
+                        exc,
+                    )
+                    break
 
             # Skip entry if no summary was obtained (rate limit hit)
             if not ai_summary.get("summary"):
@@ -230,6 +249,6 @@ if __name__ == "__main__":
 
     async def main():
         added = await fetch_batch(None)
-        print(f"added {added} new entries.")
+        print(f"added {added[1]} new entries from {added[0]} feeds")
 
     asyncio.run(main())

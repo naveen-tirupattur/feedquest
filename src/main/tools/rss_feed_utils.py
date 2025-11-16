@@ -21,8 +21,27 @@ import requests
 from bs4 import BeautifulSoup
 import feedparser
 from feedparser import FeedParserDict
+from src.main.tools.registry import add_feed
 
 logger = logging.getLogger(__name__)
+
+def register_feed(site_url: str) -> Exception | str:
+    """Discover a feed for *site_url* and add it to the registry.
+
+    The discovery function now returns a dictionary with feed metadata.  The
+    registry ``add_feed`` accepts the same structure.  A JSON‑compatible result
+    with a ``message`` field is returned.
+    """
+    feed_info = find_rss_feed(site_url)
+    if not feed_info:
+        return Exception(f"No feed found for {site_url}")
+
+    added = add_feed(feed_info)
+    if added:
+        return feed_info.get('url', '')
+    else:
+        return feed_info.get('url', '')
+
 
 def _find_link_tag(soup: BeautifulSoup) -> Optional[str]:
     """Search ``<link>`` tags for RSS/Atom declarations.

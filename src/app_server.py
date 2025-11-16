@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from typing import Optional
-from src.main.tools.utils import register_feed as register
+from src.main.tools.rss_feed_utils import register_feed as register
 from src.main.tools.registry import list_feeds
 from src.main.tools.fetcher import fetch_all_entries, fetch_feed
 import uvicorn
@@ -49,15 +49,21 @@ async def list_registered_feeds() -> List[Dict[str, str]]:
         "the number of feeds processed and entries added."
     ),
 )
-async def fetch_entries_endpoint(url: Optional[str] = None) -> dict:
+async def fetch_entries_endpoint(urls: Optional[List[str]] = None) -> dict:
     """FastAPI wrapper that supports optional single‑feed fetching.
 
     * If ``url`` is provided, only that feed is fetched via ``fetch_feed``.
     * Otherwise, ``fetch_all_entries`` processes every registered feed.
     """
-    if url:
-        added = await fetch_feed(url)
-        processed = 1
+    processed = 0
+    added = 0
+    if urls:
+
+        for url in urls:
+            if not isinstance(url, str):
+                return {"error": "Invalid URL format. 'urls' must be a list of strings."}
+            added += await fetch_feed(url)
+            processed += 1
     else:
         processed, added = await fetch_all_entries()
     return {"processed_feeds": processed, "added_entries": added}
