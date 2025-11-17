@@ -306,3 +306,17 @@ def list_entries_by_feed(feed_url: str, limit: int = 100) -> List[Dict[str, str]
             return entries
     except Exception:
         return []
+
+
+def entry_exists(entry_url: str) -> bool:
+    """Check if an entry URL already exists in the database.
+    
+    Returns True if the entry exists, False otherwise.
+    """
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM entries WHERE url = ? LIMIT 1", (entry_url,))
+            return cur.fetchone() is not None
+    except Exception:
+        return False

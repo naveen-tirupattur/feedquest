@@ -35,30 +35,29 @@ class NonRetryableError(SummarizationError):
 
 
 class RateLimiter:
-    """Token bucket rate limiter for API calls."""
+    """Token bucket rate limiter for API calls.
+    
+    Proactively spaces requests to stay under the rate limit.
+    With 30 requests per 60 seconds, this enforces ~2 second spacing.
+    """
 
     def __init__(self, max_requests: int, window_seconds: int):
         self.max_requests = max_requests
         self.window_seconds = window_seconds
-        self.request_times: List[float] = []
+        self.min_interval = window_seconds / max_requests  # ~2 seconds for 30/60
+        self.last_request_time: float = 0.0
 
     async def acquire(self):
         """Wait if necessary to stay under rate limit."""
         now = time.time()
-
-        # Remove requests older than the window
-        self.request_times = [t for t in self.request_times if now - t < self.window_seconds]
-
-        # If we've hit the limit, wait until the oldest request exits the window
-        if len(self.request_times) >= self.max_requests:
-            wait_time = self.window_seconds - (now - self.request_times[0])
-            if wait_time > 0:
-                logger.info("Rate limit approaching (30/min). Waiting %.1f seconds...", wait_time)
-                await asyncio.sleep(wait_time)
-                now = time.time()
-                self.request_times = [t for t in self.request_times if now - t < self.window_seconds]
-
-        self.request_times.append(now)
+        time_since_last = now - self.last_request_time
+        
+        if time_since_last < self.min_interval:
+            wait_time = self.min_interval - time_since_last
+            logger.debug("Rate limiting: waiting %.2f seconds", wait_time)
+            await asyncio.sleep(wait_time)
+        
+        self.last_request_time = time.time()
 
 
 # Global rate limiter

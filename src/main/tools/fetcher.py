@@ -17,7 +17,7 @@ from typing import Tuple, Optional
 import feedparser
 import httpx
 
-from src.main.tools.registry import add_entry, list_feeds, add_feed, get_feed
+from src.main.tools.registry import add_entry, list_feeds, add_feed, get_feed, entry_exists
 from src.main.tools.summarizer import summarize_text, RetryableError, NonRetryableError
 from src.main.tools.rss_feed_utils import parse_feed, register_feed
 
@@ -100,11 +100,18 @@ async def _process_feed(feed_url: str, _: None = None) -> int:
         logger.info("No entries found in feed %s", feed_url)
         return 0
 
-    # Limit to the 5 most recent entries.
-    entries = parsed[:5]
+    # Limit to the 3 most recent entries to respect API rate limits.
+    entries = parsed[:3]
     added = 0
     for entry in entries:
-        print("Processing entry: %s", entry.get("title") or entry.get("link"))
+        entry_url = entry.get("link")
+        print("Processing entry: %s", entry.get("title") or entry_url)
+        
+        # Skip if entry already exists in database
+        if entry_url and entry_exists(entry_url):
+            logger.info("Entry already exists, skipping: %s", entry_url)
+            continue
+        
         try:
             # Determine text to summarise – prefer full content if available.
             feed_content = None
@@ -121,42 +128,34 @@ async def _process_feed(feed_url: str, _: None = None) -> int:
                 continue
             logger.info("Summarizing entry from %s: %s %s",
                         feed_url, entry.get("link"), entry.get("title") or "No title")
-            # Summarize the content with limited concurrency and intelligent retry logic.
-            max_retries = 3
+            # Summarize the content with limited concurrency.
+            # Note: Rate limiting is built into the summarizer; we don't retry on 429
+            # since it means we're hitting the API limit and retrying will just waste quota.
             ai_summary = {"summary": "", "ai_tags": []}
-            for attempt in range(max_retries):
-                try:
-                    async with _summarizer_semaphore:
-                        ai_summary = await summarize_text(feed_content)
-                    # Success – exit retry loop
-                    break
-                except NonRetryableError as exc:
-                    # Don't retry on auth, validation, or format errors
-                    logger.warning(
-                        "Non-retryable error summarizing entry from %s: %s",
-                        feed_url,
-                        exc,
-                    )
-                    break
-                except RetryableError as exc:
-                    # Only log and retry on transient errors (rate limits, timeouts, server errors)
-                    logger.warning(
-                        "Attempt %d failed (retryable) for %s: %s",
-                        attempt + 1,
-                        feed_url,
-                        exc,
-                    )
-                    if attempt < max_retries - 1:
-                        # Exponential backoff with jitter
-                        backoff = (2 ** attempt) + random.random()
-                        await asyncio.sleep(backoff)
-                except Exception as exc:  # pragma: no cover – unexpected errors
-                    logger.error(
-                        "Unexpected error summarizing entry from %s: %s",
-                        feed_url,
-                        exc,
-                    )
-                    break
+            try:
+                async with _summarizer_semaphore:
+                    ai_summary = await summarize_text(feed_content)
+            except NonRetryableError as exc:
+                # Don't retry on auth, validation, or format errors
+                logger.warning(
+                    "Non-retryable error summarizing entry from %s: %s",
+                    feed_url,
+                    exc,
+                )
+            except RetryableError as exc:
+                # Rate limits: skip entry since retrying wastes quota
+                # Other transient errors: could add retry logic here if needed
+                logger.warning(
+                    "Retryable error (skipping) for %s: %s",
+                    feed_url,
+                    exc,
+                )
+            except Exception as exc:  # pragma: no cover – unexpected errors
+                logger.error(
+                    "Unexpected error summarizing entry from %s: %s",
+                    feed_url,
+                    exc,
+                )
 
             # Skip entry if no summary was obtained (rate limit hit)
             if not ai_summary.get("summary"):
@@ -194,29 +193,38 @@ async def _process_feed(feed_url: str, _: None = None) -> int:
             logger.error("Failed to store entry from %s: %s", feed_url, exc)
             continue
 
-    # Update feed metadata if server provided new values.
+    # Always update feed metadata, even if no new entries were added.
+    # This prevents fetching the same feed repeatedly if all entries are duplicates.
+    # Update last_modified to current time to track when we last processed this feed.
+    from datetime import datetime, timezone
     new_etag = response.headers.get("ETag")
-    new_last_modified = response.headers.get("Last-Modified")
-    if new_etag or new_last_modified:
-        # Updating feed metadata also writes to SQLite; serialize it.
-        async with _db_write_lock:
-            add_feed({"url": feed_url, "etag": new_etag, "last_modified": new_last_modified})
+    now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    async with _db_write_lock:
+        add_feed({"url": feed_url, "etag": new_etag, "last_modified": now_iso})
 
     return added
 
 async def fetch_batch(feed_urls: Optional[list[str]]) -> Tuple[int, int]:
-    """Fetch entries for a batch of feed URLs concurrently.
+    """Fetch entries for a batch of feed URLs sequentially.
 
-    If ``feed_urls`` is None or empty, it fetches 10 oldest feeds from the registry.
+    If ``feed_urls`` is None or empty, it fetches the 2 oldest feeds from the registry.
     Returns a ``(feeds_processed, total_entries_added)`` tuple.
+    
+    Note: Feeds are processed sequentially (not concurrently) to respect rate limits.
+    Feeds are sorted by last_modified (when we last processed them), oldest first.
     """
     if not feed_urls:
         all_feeds = list_feeds()
-        all_feeds.sort(key=lambda f: f.get("last_modified"))
-        feed_urls = [f["url"] for f in all_feeds[:5]]
-    tasks = [_process_feed(url) for url in feed_urls]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    total_added = sum(r if isinstance(r, int) else 0 for r in results)
+        # Sort by when we last processed the feed (last_modified timestamp), oldest first
+        all_feeds.sort(key=lambda f: f.get("last_modified", ""))
+        feed_urls = [f["url"] for f in all_feeds[:2]]
+    
+    total_added = 0
+    for url in feed_urls:
+        result = await _process_feed(url)
+        if isinstance(result, int):
+            total_added += result
+    
     return len(feed_urls), total_added
 
 async def fetch_all_entries() -> Tuple[int, int]:
